@@ -22,6 +22,7 @@ interface PRDetails {
   pull_number: number;
   title: string;
   description: string;
+  commit_id: string;
 }
 
 async function getPRDetails(): Promise<PRDetails> {
@@ -33,12 +34,26 @@ async function getPRDetails(): Promise<PRDetails> {
     repo: repository.name,
     pull_number: number,
   });
+  // Fetch the list of commits in the PR
+  const commitsResponse = await octokit.pulls.listCommits({
+    owner: repository.owner.login,
+    repo: repository.name,
+    pull_number: number,
+    per_page: 100,
+  });
+
+  // Get the latest commit
+  const latestCommit = commitsResponse.data[commitsResponse.data.length - 1];
+
+  // Get the SHA of the latest commit
+  const latestCommitSha = latestCommit.sha;
   return {
     owner: repository.owner.login,
     repo: repository.name,
     pull_number: number,
     title: prResponse.data.title ?? "",
     description: prResponse.data.body ?? "",
+    commit_id: latestCommitSha
   };
 }
 
@@ -80,6 +95,20 @@ async function analyzeCode(
 }
 
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
+  const diffContent = chunk.changes
+      .map((change) => {
+        let lineNumber = "";
+        if (change.type === "add" || change.type === "del") {
+          lineNumber = change.ln ? change.ln.toString() : "";
+        } else if (change.type === "normal") {
+          lineNumber = change.ln1 ? change.ln1.toString() : "";
+        }
+        return `${lineNumber} ${change.content}`;
+      })
+      .join("\n");
+
+
+
   return `Your task is to review pull requests. Instructions:
 - Do not give positive comments or compliments.
 - Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
@@ -87,6 +116,9 @@ function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
 - never comment on file formatting and linting issues
+- Always propose a code solution to the issue.
+- Don't check package imports.
+- Don't suggest adding comments.
 ${EXTRA_INSTRUCTIONS}
 
 Review the following code diff in the file "${
@@ -104,10 +136,7 @@ Git diff to review:
 
 \`\`\`diff
 ${chunk.content}
-${chunk.changes
-  // @ts-expect-error - ln and ln2 exists where needed
-  .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-  .join("\n")}
+${diffContent}
 \`\`\`
 `;
 }
@@ -119,7 +148,7 @@ async function getAIResponse(prompt: string): Promise<Array<{
   const queryConfig = {
     model: OPENAI_API_MODEL,
     temperature: 0,
-    max_tokens: 700,
+    max_tokens: 1500,
     top_p: 1,
     frequency_penalty: 0,
     presence_penalty: 0,
@@ -128,34 +157,37 @@ async function getAIResponse(prompt: string): Promise<Array<{
   try {
     response = await openai.chat.completions.create({
       ...queryConfig,
-      response_format: { type: "json_schema", json_schema: {
-        name: "response",
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "response",
           schema: {
-            "type": "object",
-            "properties": {
-              "reviews": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "lineNumber": {
-                      "type": "integer",
-                      "description": "The line number being reviewed"
+            type: "object",
+            properties: {
+              reviews: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    lineNumber: {
+                      type: "integer",
+                      description: "The line number being reviewed",
                     },
-                    "reviewComment": {
-                      "type": "string",
-                      "description": "The comment for the review"
-                    }
+                    reviewComment: {
+                      type: "string",
+                      description: "The comment for the review",
+                    },
                   },
-                  "required": ["lineNumber", "reviewComment"],
-                  "additionalProperties": false
-                }
-              }
+                  required: ["lineNumber", "reviewComment"],
+                  additionalProperties: false,
+                },
+              },
             },
-            "required": ["reviews"],
-            "additionalProperties": false
-          }
-        } } ,
+            required: ["reviews"],
+            additionalProperties: false,
+          },
+        },
+      },
       messages: [
         {
           role: "system",
@@ -163,6 +195,14 @@ async function getAIResponse(prompt: string): Promise<Array<{
         },
       ],
     });
+
+    const finish_response = response.choices[0].finish_reason;
+    if (finish_response === "length") {
+      console.log(
+        "The maximum context length has been exceeded. Please reduce the length of the code snippets."
+      );
+      return null;
+    }
 
     const res = response.choices[0].message?.content?.trim() || "{}";
     return JSON.parse(res).reviews;
@@ -180,31 +220,69 @@ function createComment(
     reviewComment: string;
   }>
 ): Array<{ body: string; path: string; line: number }> {
-  return aiResponses.flatMap((aiResponse) => {
-    if (!file.to) {
-      return [];
+  const comments: Array<{ body: string; path: string; position: number }> = [];
+  const lineNumberToPosition = new Map<number, number>();
+  let position = 0;
+
+  // Build the mapping from line numbers to positions
+  for (const change of chunk.changes) {
+    position++;
+    let lineNumber: number | undefined;
+    if (change.type === "add" || change.type === "del") {
+      lineNumber = change.ln;
+    } else if (change.type === "normal") {
+      lineNumber = change.ln1;
     }
-    return {
-      body: aiResponse.reviewComment,
-      path: file.to,
-      line: Number(aiResponse.lineNumber),
-    };
-  });
+
+    if (lineNumber != null) {
+      lineNumberToPosition.set(lineNumber, position);
+    }
+  }
+
+  for (const aiResponse of aiResponses) {
+    const lineNumber = Number(aiResponse.lineNumber);
+    const pos = lineNumberToPosition.get(lineNumber);
+    if (pos != null) {
+      comments.push({
+        body: aiResponse.reviewComment,
+        path: file.to!,
+        position: pos,
+      });
+    } else {
+      console.error(
+          `Line number ${lineNumber} not found in diff for file ${file.to}`
+      );
+    }
+  }
+
+
+
+
+  return comments;
 }
 
 async function createReviewComment(
   owner: string,
   repo: string,
   pull_number: number,
+  commit_id: string,
   comments: Array<{ body: string; path: string; line: number }>
 ): Promise<void> {
-  await octokit.pulls.createReview({
-    owner,
-    repo,
-    pull_number,
-    comments,
-    event: "COMMENT",
-  });
+  try {
+    await octokit.pulls.createReview({
+      owner,
+      repo,
+      pull_number,
+      commit_id,
+      comments,
+      event: "COMMENT",
+    });
+  } catch (error: any) {
+    console.error(`Error creating review comment: ${error}`);
+    if (error.status === 422) {
+      console.error("One or more comments have invalid positions or lines.");
+    }
+  }
 }
 
 async function main() {
@@ -214,27 +292,12 @@ async function main() {
     readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
   );
 
-  if (eventData.action === "opened") {
+  if (eventData.action === "opened" || eventData.action === "synchronize") {
     diff = await getDiff(
       prDetails.owner,
       prDetails.repo,
       prDetails.pull_number
     );
-  } else if (eventData.action === "synchronize") {
-    const newBaseSha = eventData.before;
-    const newHeadSha = eventData.after;
-
-    const response = await octokit.repos.compareCommits({
-      headers: {
-        accept: "application/vnd.github.v3.diff",
-      },
-      owner: prDetails.owner,
-      repo: prDetails.repo,
-      base: newBaseSha,
-      head: newHeadSha,
-    });
-
-    diff = String(response.data);
   } else {
     console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
     return;
@@ -250,7 +313,8 @@ async function main() {
   const excludePatterns = core
     .getInput("exclude")
     .split(",")
-    .map((s) => s.trim());
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 
   const filteredDiff = parsedDiff.filter((file) => {
     return !excludePatterns.some((pattern) =>
@@ -264,8 +328,11 @@ async function main() {
       prDetails.owner,
       prDetails.repo,
       prDetails.pull_number,
+      prDetails.commit_id,
       comments
     );
+  } else {
+    console.log("No comments to post.");
   }
 }
 

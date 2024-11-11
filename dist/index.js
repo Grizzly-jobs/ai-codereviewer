@@ -65,12 +65,24 @@ function getPRDetails() {
             repo: repository.name,
             pull_number: number,
         });
+        // Fetch the list of commits in the PR
+        const commitsResponse = yield octokit.pulls.listCommits({
+            owner: repository.owner.login,
+            repo: repository.name,
+            pull_number: number,
+            per_page: 100,
+        });
+        // Get the latest commit
+        const latestCommit = commitsResponse.data[commitsResponse.data.length - 1];
+        // Get the SHA of the latest commit
+        const latestCommitSha = latestCommit.sha;
         return {
             owner: repository.owner.login,
             repo: repository.name,
             pull_number: number,
             title: (_a = prResponse.data.title) !== null && _a !== void 0 ? _a : "",
             description: (_b = prResponse.data.body) !== null && _b !== void 0 ? _b : "",
+            commit_id: latestCommitSha
         };
     });
 }
@@ -107,6 +119,18 @@ function analyzeCode(parsedDiff, prDetails) {
     });
 }
 function createPrompt(file, chunk, prDetails) {
+    const diffContent = chunk.changes
+        .map((change) => {
+        let lineNumber = "";
+        if (change.type === "add" || change.type === "del") {
+            lineNumber = change.ln ? change.ln.toString() : "";
+        }
+        else if (change.type === "normal") {
+            lineNumber = change.ln1 ? change.ln1.toString() : "";
+        }
+        return `${lineNumber} ${change.content}`;
+    })
+        .join("\n");
     return `Your task is to review pull requests. Instructions:
 - Do not give positive comments or compliments.
 - Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
@@ -114,6 +138,9 @@ function createPrompt(file, chunk, prDetails) {
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
 - never comment on file formatting and linting issues
+- Always propose a code solution to the issue.
+- Don't check package imports.
+- Don't suggest adding comments.
 ${EXTRA_INSTRUCTIONS}
 
 Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
@@ -129,10 +156,7 @@ Git diff to review:
 
 \`\`\`diff
 ${chunk.content}
-${chunk.changes
-        // @ts-expect-error - ln and ln2 exists where needed
-        .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-        .join("\n")}
+${diffContent}
 \`\`\`
 `;
 }
@@ -142,46 +166,54 @@ function getAIResponse(prompt) {
         const queryConfig = {
             model: OPENAI_API_MODEL,
             temperature: 0,
-            max_tokens: 700,
+            max_tokens: 1500,
             top_p: 1,
             frequency_penalty: 0,
             presence_penalty: 0,
         };
         let response = null;
         try {
-            response = yield openai.chat.completions.create(Object.assign(Object.assign({}, queryConfig), { response_format: { type: "json_schema", json_schema: {
+            response = yield openai.chat.completions.create(Object.assign(Object.assign({}, queryConfig), { response_format: {
+                    type: "json_schema",
+                    json_schema: {
                         name: "response",
                         schema: {
-                            "type": "object",
-                            "properties": {
-                                "reviews": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "lineNumber": {
-                                                "type": "integer",
-                                                "description": "The line number being reviewed"
+                            type: "object",
+                            properties: {
+                                reviews: {
+                                    type: "array",
+                                    items: {
+                                        type: "object",
+                                        properties: {
+                                            lineNumber: {
+                                                type: "integer",
+                                                description: "The line number being reviewed",
                                             },
-                                            "reviewComment": {
-                                                "type": "string",
-                                                "description": "The comment for the review"
-                                            }
+                                            reviewComment: {
+                                                type: "string",
+                                                description: "The comment for the review",
+                                            },
                                         },
-                                        "required": ["lineNumber", "reviewComment"],
-                                        "additionalProperties": false
-                                    }
-                                }
+                                        required: ["lineNumber", "reviewComment"],
+                                        additionalProperties: false,
+                                    },
+                                },
                             },
-                            "required": ["reviews"],
-                            "additionalProperties": false
-                        }
-                    } }, messages: [
+                            required: ["reviews"],
+                            additionalProperties: false,
+                        },
+                    },
+                }, messages: [
                     {
                         role: "system",
                         content: prompt,
                     },
                 ] }));
+            const finish_response = response.choices[0].finish_reason;
+            if (finish_response === "length") {
+                console.log("The maximum context length has been exceeded. Please reduce the length of the code snippets.");
+                return null;
+            }
             const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
             return JSON.parse(res).reviews;
         }
@@ -192,26 +224,57 @@ function getAIResponse(prompt) {
     });
 }
 function createComment(file, chunk, aiResponses) {
-    return aiResponses.flatMap((aiResponse) => {
-        if (!file.to) {
-            return [];
+    const comments = [];
+    const lineNumberToPosition = new Map();
+    let position = 0;
+    // Build the mapping from line numbers to positions
+    for (const change of chunk.changes) {
+        position++;
+        let lineNumber;
+        if (change.type === "add" || change.type === "del") {
+            lineNumber = change.ln;
         }
-        return {
-            body: aiResponse.reviewComment,
-            path: file.to,
-            line: Number(aiResponse.lineNumber),
-        };
-    });
+        else if (change.type === "normal") {
+            lineNumber = change.ln1;
+        }
+        if (lineNumber != null) {
+            lineNumberToPosition.set(lineNumber, position);
+        }
+    }
+    for (const aiResponse of aiResponses) {
+        const lineNumber = Number(aiResponse.lineNumber);
+        const pos = lineNumberToPosition.get(lineNumber);
+        if (pos != null) {
+            comments.push({
+                body: aiResponse.reviewComment,
+                path: file.to,
+                position: pos,
+            });
+        }
+        else {
+            console.error(`Line number ${lineNumber} not found in diff for file ${file.to}`);
+        }
+    }
+    return comments;
 }
-function createReviewComment(owner, repo, pull_number, comments) {
+function createReviewComment(owner, repo, pull_number, commit_id, comments) {
     return __awaiter(this, void 0, void 0, function* () {
-        yield octokit.pulls.createReview({
-            owner,
-            repo,
-            pull_number,
-            comments,
-            event: "COMMENT",
-        });
+        try {
+            yield octokit.pulls.createReview({
+                owner,
+                repo,
+                pull_number,
+                commit_id,
+                comments,
+                event: "COMMENT",
+            });
+        }
+        catch (error) {
+            console.error(`Error creating review comment: ${error}`);
+            if (error.status === 422) {
+                console.error("One or more comments have invalid positions or lines.");
+            }
+        }
     });
 }
 function main() {
@@ -220,22 +283,8 @@ function main() {
         const prDetails = yield getPRDetails();
         let diff;
         const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
-        if (eventData.action === "opened") {
+        if (eventData.action === "opened" || eventData.action === "synchronize") {
             diff = yield getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
-        }
-        else if (eventData.action === "synchronize") {
-            const newBaseSha = eventData.before;
-            const newHeadSha = eventData.after;
-            const response = yield octokit.repos.compareCommits({
-                headers: {
-                    accept: "application/vnd.github.v3.diff",
-                },
-                owner: prDetails.owner,
-                repo: prDetails.repo,
-                base: newBaseSha,
-                head: newHeadSha,
-            });
-            diff = String(response.data);
         }
         else {
             console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
@@ -249,13 +298,17 @@ function main() {
         const excludePatterns = core
             .getInput("exclude")
             .split(",")
-            .map((s) => s.trim());
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
         const filteredDiff = parsedDiff.filter((file) => {
             return !excludePatterns.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : "", pattern); });
         });
         const comments = yield analyzeCode(filteredDiff, prDetails);
         if (comments.length > 0) {
-            yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
+            yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, prDetails.commit_id, comments);
+        }
+        else {
+            console.log("No comments to post.");
         }
     });
 }
