@@ -80,7 +80,6 @@ async function analyzeCode(
 
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
   return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
 - Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
 - Write the comment in GitHub Markdown format.
@@ -116,20 +115,44 @@ async function getAIResponse(prompt: string): Promise<Array<{
 }> | null> {
   const queryConfig = {
     model: OPENAI_API_MODEL,
-    temperature: 0.2,
+    temperature: 0,
     max_tokens: 700,
     top_p: 1,
     frequency_penalty: 0,
     presence_penalty: 0,
   };
-
+  let response: OpenAI.Chat.Completions.ChatCompletion | null = null;
   try {
-    const response = await openai.chat.completions.create({
+    response = await openai.chat.completions.create({
       ...queryConfig,
-      // return JSON if the model supports it:
-      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
-        ? { response_format: { type: "json_object" } }
-        : {}),
+      response_format: { type: "json_schema", json_schema: {
+        name: "response",
+          schema: {
+            "type": "object",
+            "properties": {
+              "reviews": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "lineNumber": {
+                      "type": "integer",
+                      "description": "The line number being reviewed"
+                    },
+                    "reviewComment": {
+                      "type": "string",
+                      "description": "The comment for the review"
+                    }
+                  },
+                  "required": ["lineNumber", "reviewComment"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": ["reviews"],
+            "additionalProperties": false
+          }
+        } } ,
       messages: [
         {
           role: "system",
@@ -141,7 +164,7 @@ async function getAIResponse(prompt: string): Promise<Array<{
     const res = response.choices[0].message?.content?.trim() || "{}";
     return JSON.parse(res).reviews;
   } catch (error) {
-    console.error("Error:", error);
+    console.error("Error:", error, response?.choices[0].message?.content);
     return null;
   }
 }
