@@ -51,6 +51,7 @@ const minimatch_1 = __importDefault(__nccwpck_require__(2868));
 const GITHUB_TOKEN = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
+const EXTRA_INSTRUCTIONS = core.getInput("EXTRA_INSTRUCTIONS");
 const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
 const openai = new openai_1.default({
     apiKey: OPENAI_API_KEY,
@@ -112,6 +113,8 @@ function createPrompt(file, chunk, prDetails) {
 - Write the comment in GitHub Markdown format.
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
+- never comment on file formatting and linting issues
+${EXTRA_INSTRUCTIONS}
 
 Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
   
