@@ -220,33 +220,16 @@ function createComment(
     reviewComment: string;
   }>
 ): Array<{ body: string; path: string; line: number }> {
-  const comments: Array<{ body: string; path: string; position: number }> = [];
-  const lineNumberToPosition = new Map<number, number>();
-  let position = 0;
-
-  // Build the mapping from line numbers to positions
-  for (const change of chunk.changes) {
-    position++;
-    let lineNumber: number | undefined;
-    if (change.type === "add" || change.type === "del") {
-      lineNumber = change.ln;
-    } else if (change.type === "normal") {
-      lineNumber = change.ln1;
-    }
-
-    if (lineNumber != null) {
-      lineNumberToPosition.set(lineNumber, position);
-    }
-  }
+  const comments: Array<{ body: string; path: string; line: number }> = [];
 
   for (const aiResponse of aiResponses) {
     const lineNumber = Number(aiResponse.lineNumber);
-    const pos = lineNumberToPosition.get(lineNumber);
-    if (pos != null) {
+    if (lineNumber != null) {
+      console.log(`Commenting on line ${lineNumber} in file ${file.to}`);
       comments.push({
         body: aiResponse.reviewComment,
         path: file.to!,
-        position: pos,
+        line: lineNumber,
       });
     } else {
       console.error(
@@ -254,10 +237,6 @@ function createComment(
       );
     }
   }
-
-
-
-
   return comments;
 }
 

@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "build": "tsc",
-    "package": "ncc build --source-map --license licenses.txt",
+    "package": "tsc && ncc build --source-map --license licenses.txt",
     "format": "prettier --write .",
     "lint": "prettier --check ."
   },
