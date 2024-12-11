@@ -93,55 +93,90 @@ async function analyzeCode(
   }
   return comments;
 }
-
-function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
+function createPrompt(file, chunk, prDetails) {
   const diffContent = chunk.changes
-      .map((change) => {
-        let lineNumber = "";
-        if (change.type === "add" || change.type === "del") {
-          lineNumber = change.ln ? change.ln.toString() : "";
-        } else if (change.type === "normal") {
-          lineNumber = change.ln1 ? change.ln1.toString() : "";
-        }
-        return `${lineNumber} ${change.content}`;
-      })
-      .join("\n");
+    .map((change) => {
+      let lineNumber = "";
+      if (change.type === "add" || change.type === "del") {
+        lineNumber = change.ln ? change.ln.toString() : "";
+      } else if (change.type === "normal") {
+        lineNumber = change.ln1 ? change.ln1.toString() : "";
+      }
+      return `${lineNumber} ${change.content}`;
+    })
+    .join("\n");
 
+  const content = `You are an expert AI code reviewer specializing in Java, Spring, and SQL. You will be provided with a pull request (PR) title, PR description, and the Git diff. Your task is to review the changes in the Git diff and identify potential issues, while demonstrating your in-depth knowledge of Spring.
 
+- Focus exclusively on areas in the code where there might be a problem, but avoid mentioning issues that a compiler would catch, such as incorrect function calls.
+- If the code is satisfactory, return an empty array—do not include any positive comments or compliments.
+- The PR title and description are for context only and should not be commented on.
+- Do not comment on file formatting, linting issues, suggest adding comments, or issues like null values in \`getReferenceById\` which never returns null but throws an exception.
+- All comments should be written in GitHub Markdown format.
 
-  return `Your task is to review pull requests. Instructions:
-- Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the comment in GitHub Markdown format.
-- Use the given description only for the overall context and only comment the code.
-- IMPORTANT: NEVER suggest adding comments to the code.
-- never comment on file formatting and linting issues
-- Always propose a code solution to the issue.
-- Don't check package imports.
-- Don't suggest adding comments.
-${EXTRA_INSTRUCTIONS}
+# Output Format
 
-Review the following code diff in the file "${
-    file.to
-  }" and take the pull request title and description into account when writing the response.
-  
-Pull request title: ${prDetails.title}
-Pull request description:
+Return output in JSON format with an array containing comment objects. Each comment object should include:
+- \`lineNumber\`: the line number of the issue.
+- \`reviewComment\`: details of the concern in GitHub Markdown format.
 
+# Examples
+
+**Input:**
+- PR Title: "Fix login retry logic"
+- PR Description: "Corrects the retry logic to prevent endless loops."
+- Git Diff:
+  \`\`\`java
+  @@ -10,5 +10,7 @@
+  while (currentTry > MAX_TRIES) {
+      // retry logic
+  }
+  \`\`\`
+
+**Output:**
+\`\`\`
+[
+  {
+    "lineNumber": 2,
+    "reviewComment": "The condition \`currentTry > MAX_TRIES\` is incorrect for the retry logic. It should be \`currentTry < MAX_TRIES\` to limit the number of tries."
+  }
+]
+\`\`\`
+
+(Note: Real examples may vary in length and complexity. Use placeholders to represent the context and structure of comments.)
+\``;
+
+  const userMessage = `Please review my PR:
+
+The title is:
+${prDetails.title}
+
+The description is: 
 ---
 ${prDetails.description}
 ---
 
-Git diff to review:
-
+The git diff is:
 \`\`\`diff
 ${chunk.content}
 ${diffContent}
-\`\`\`
-`;
+\`\`\``;
+
+  return [
+    {
+      role: "system",
+      content,
+    },
+    {
+      role: "user",
+      content: userMessage,
+    },
+  ];
 }
 
-async function getAIResponse(prompt: string): Promise<Array<{
+
+
+async function getAIResponse(prompt): Promise<Array<{
   lineNumber: string;
   reviewComment: string;
 }> | null> {
@@ -188,12 +223,7 @@ async function getAIResponse(prompt: string): Promise<Array<{
           },
         },
       },
-      messages: [
-        {
-          role: "system",
-          content: prompt,
-        },
-      ],
+      messages: prompt,
     });
 
     const finish_response = response.choices[0].finish_reason;
